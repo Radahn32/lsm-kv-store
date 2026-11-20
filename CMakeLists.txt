@@ -23,6 +23,9 @@ FetchContent_MakeAvailable(googletest)
 
 enable_testing()
 
+add_library(kvstore_core src/core/memtable.cpp)
+target_include_directories(kvstore_core PUBLIC include)
+
 # Sanity test to verify toolchain
 add_executable(sanity_test tests/sanity_test.cpp)
 target_include_directories(sanity_test PRIVATE include)
@@ -30,3 +33,13 @@ target_link_libraries(sanity_test PRIVATE GTest::gtest_main)
 
 include(GoogleTest)
 gtest_discover_tests(sanity_test)
+
+add_executable(memtable_test tests/memtable_test.cpp)
+target_include_directories(memtable_test PRIVATE include)
+target_link_libraries(memtable_test PRIVATE GTest::gtest_main)
+target_link_libraries(memtable_test PRIVATE kvstore_core)
+add_test(NAME memtable_test COMMAND memtable_test)
+if(ENABLE_SANITIZERS)
+    # LeakSanitizer cannot inspect processes under this execution environment's ptrace.
+    set_tests_properties(memtable_test PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+endif()
