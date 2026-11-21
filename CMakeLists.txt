@@ -22,24 +22,26 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(googletest)
 
 enable_testing()
+include(GoogleTest)
 
-add_library(kvstore_core src/core/memtable.cpp)
+# Core library with auto-discovered sources
+file(GLOB_RECURSE KVSTORE_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp")
+list(FILTER KVSTORE_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
+
+add_library(kvstore_core ${KVSTORE_SOURCES})
 target_include_directories(kvstore_core PUBLIC include)
 
-# Sanity test to verify toolchain
-add_executable(sanity_test tests/sanity_test.cpp)
-target_include_directories(sanity_test PRIVATE include)
-target_link_libraries(sanity_test PRIVATE GTest::gtest_main)
+# Auto-discover test executables
+file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")
 
-include(GoogleTest)
-gtest_discover_tests(sanity_test)
-
-add_executable(memtable_test tests/memtable_test.cpp)
-target_include_directories(memtable_test PRIVATE include)
-target_link_libraries(memtable_test PRIVATE GTest::gtest_main)
-target_link_libraries(memtable_test PRIVATE kvstore_core)
-add_test(NAME memtable_test COMMAND memtable_test)
-if(ENABLE_SANITIZERS)
-    # LeakSanitizer cannot inspect processes under this execution environment's ptrace.
-    set_tests_properties(memtable_test PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
-endif()
+foreach(test_src ${TEST_SOURCES})
+    get_filename_component(test_target ${test_src} NAME_WE)
+    add_executable(${test_target} ${test_src})
+    target_include_directories(${test_target} PRIVATE include)
+    target_link_libraries(${test_target} PRIVATE kvstore_core GTest::gtest_main)
+    if(ENABLE_SANITIZERS)
+        gtest_discover_tests(${test_target} PROPERTIES ENVIRONMENT "ASAN_OPTIONS=detect_leaks=0")
+    else()
+        gtest_discover_tests(${test_target})
+    endif()
+endforeach()
