@@ -7,6 +7,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <thread>
 
@@ -16,9 +17,9 @@ namespace kvstore {
 class DiskStorage {
 public:
     virtual ~DiskStorage() = default;
+    virtual Timestamp MaxVersion() const = 0;
     virtual Status GetAsOf(const std::string&, Timestamp, InternalKey*, std::string*) const = 0;
-    virtual Status Scan(const std::string&, const std::string&,
-                        std::vector<std::pair<std::string,std::string>>*) const = 0;
+    virtual std::unique_ptr<Iterator> NewIterator() const = 0;
     virtual Status Flush(Iterator&) = 0;
 };
 
@@ -44,6 +45,7 @@ public:
 
 private:
     Status Write(const std::string&, const std::string&, ValueType);
+    Status OpenLocked();
     Status ReadAt(const std::string&, Timestamp, std::string*) const;
     void FlushWorker();
     DBOptions options_;
@@ -53,7 +55,10 @@ private:
     std::shared_ptr<MemTable> active_;
     std::vector<std::shared_ptr<MemTable>> immutable_;
     Timestamp next_version_ = 1;
-    bool opened_ = false, stopping_ = false, flushing_ = false;
+    bool opened_ = false;
+    bool stopping_ = false;
+    bool flushing_ = false;
+    Status flush_status_ = Status::Ok();
     std::mutex flush_mutex_;
     std::condition_variable flush_cv_;
     std::thread flush_thread_;
