@@ -13,6 +13,8 @@
 
 namespace kvstore {
 
+class BlockCache;
+
 constexpr uint64_t kSSTableMagicNumber = 0x53535461626C6531ULL; // "SSTable1"
 constexpr size_t kFooterSize = 48;
 constexpr size_t kTargetBlockSize = 4096;
@@ -76,7 +78,10 @@ private:
 
 class SSTableReader {
 public:
-    static Status Open(const std::string& filepath, std::unique_ptr<SSTableReader>* reader);
+    static Status Open(const std::string& filepath,
+                       std::unique_ptr<SSTableReader>* reader,
+                       uint64_t file_id = 0,
+                       BlockCache* cache = nullptr);
     ~SSTableReader();
 
     SSTableReader(const SSTableReader&) = delete;
@@ -94,6 +99,8 @@ public:
     // Range iteration across all Data Blocks in the SSTable
     std::unique_ptr<Iterator> NewIterator() const;
 
+    uint64_t file_id() const noexcept { return file_id_; }
+    BlockCache* cache() const noexcept { return cache_; }
     Timestamp MaxVersion() const noexcept { return max_version_; }
     Timestamp max_version() const noexcept { return max_version_; }
     uint64_t file_size() const noexcept { return file_size_; }
@@ -104,11 +111,14 @@ private:
     friend class SSTableIterator;
 
     SSTableReader() = default;
-    Status Init(const std::string& filepath);
+    Status Init(const std::string& filepath, uint64_t file_id, BlockCache* cache);
 
     int fd_{-1};
     const char* data_{nullptr};
     size_t file_size_{0};
+
+    uint64_t file_id_{0};
+    BlockCache* cache_{nullptr};
 
     std::string_view filter_data_;
     std::vector<BlockHandle> index_entries_;
