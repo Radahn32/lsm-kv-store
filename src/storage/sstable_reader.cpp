@@ -1,4 +1,5 @@
 #include "storage/sstable.hpp"
+#include "storage/block_cache.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -36,6 +37,7 @@ public:
     void SeekToFirst() override {
         block_idx_ = 0;
         offset_in_block_ = 0;
+        current_block_data_.reset();
         DecodeCurrent();
     }
 
@@ -57,11 +59,13 @@ public:
         if (it == reader_->index_entries_.end()) {
             valid_ = false;
             block_idx_ = reader_->index_entries_.size();
+            current_block_data_.reset();
             return;
         }
 
         block_idx_ = static_cast<size_t>(std::distance(reader_->index_entries_.begin(), it));
         offset_in_block_ = 0;
+        current_block_data_.reset();
 
         while (true) {
             DecodeCurrent();
@@ -104,10 +108,23 @@ private:
             if (offset_in_block_ >= block.size) {
                 block_idx_++;
                 offset_in_block_ = 0;
+                current_block_data_.reset();
                 continue;
             }
 
-            const char* block_ptr = reader_->data_ + block.offset + offset_in_block_;
+            if (reader_->cache_) {
+                if (!current_block_data_) {
+                    current_block_data_ = reader_->cache_->Get(reader_->file_id_, block.offset);
+                    if (!current_block_data_) {
+                        current_block_data_ = std::make_shared<const std::string>(reader_->data_ + block.offset, block.size);
+                        reader_->cache_->Put(reader_->file_id_, block.offset, current_block_data_);
+                    }
+                }
+            }
+
+            const char* block_ptr = current_block_data_
+                ? current_block_data_->data() + offset_in_block_
+                : reader_->data_ + block.offset + offset_in_block_;
             const size_t remaining = block.size - offset_in_block_;
 
             if (remaining < 4 + 8 + 1 + 4) {
@@ -145,18 +162,22 @@ private:
     size_t offset_in_block_{0};
     size_t entry_total_len_{0};
 
+    std::shared_ptr<const std::string> current_block_data_;
     InternalKey current_key_;
     std::string_view current_value_;
     bool valid_{false};
 };
 
-Status SSTableReader::Open(const std::string& filepath, std::unique_ptr<SSTableReader>* reader) {
+Status SSTableReader::Open(const std::string& filepath,
+                           std::unique_ptr<SSTableReader>* reader,
+                           uint64_t file_id,
+                           BlockCache* cache) {
     if (!reader) {
         return {Status::Code::kInvalidArgument, "Output reader pointer cannot be null"};
     }
 
     auto r = std::unique_ptr<SSTableReader>(new SSTableReader());
-    Status s = r->Init(filepath);
+    Status s = r->Init(filepath, file_id, cache);
     if (!s.ok()) {
         return s;
     }
@@ -176,7 +197,10 @@ SSTableReader::~SSTableReader() {
     }
 }
 
-Status SSTableReader::Init(const std::string& filepath) {
+Status SSTableReader::Init(const std::string& filepath, uint64_t file_id, BlockCache* cache) {
+    file_id_ = file_id;
+    cache_ = cache;
+
     fd_ = open(filepath.c_str(), O_RDONLY);
     if (fd_ < 0) {
         return Status::IOError("Failed to open SSTable file: " + filepath + " (" + strerror(errno) + ")");
@@ -315,7 +339,19 @@ Status SSTableReader::GetAsOf(const std::string& key, Timestamp timestamp,
     }
 
     for (; it != index_entries_.end(); ++it) {
-        const char* block_ptr = data_ + it->offset;
+        std::shared_ptr<const std::string> cached_block;
+        const char* block_ptr = nullptr;
+        if (cache_) {
+            cached_block = cache_->Get(file_id_, it->offset);
+            if (!cached_block) {
+                cached_block = std::make_shared<const std::string>(data_ + it->offset, it->size);
+                cache_->Put(file_id_, it->offset, cached_block);
+            }
+            block_ptr = cached_block->data();
+        } else {
+            block_ptr = data_ + it->offset;
+        }
+
         const size_t block_size = it->size;
         size_t offset = 0;
         bool found_user_key = false;
