@@ -164,14 +164,22 @@ void MergingIterator::Next() {
 LevelManager::LevelManager(std::string db_dir,
                            size_t block_cache_capacity,
                            size_t max_levels,
-                           size_t bits_per_key)
+                           size_t bits_per_key,
+                           CompactionOptions options)
     : db_dir_(std::move(db_dir)),
       manifest_path_((std::filesystem::path(db_dir_) / "MANIFEST").string()),
       max_levels_(max_levels),
       bits_per_key_(bits_per_key),
+      options_(std::move(options)),
       block_cache_(std::make_shared<BlockCache>(block_cache_capacity)) {
+    options_.bits_per_key = bits_per_key_;
     levels_.resize(max_levels_);
     (void)Recover();
+    StartBackgroundThread();
+}
+
+LevelManager::~LevelManager() {
+    StopBackgroundThread();
 }
 
 Status LevelManager::Recover() {
@@ -332,11 +340,7 @@ Status LevelManager::Flush(Iterator& iter) {
         return Status::Ok();
     }
 
-    uint64_t file_id = 0;
-    {
-        std::unique_lock lock(mutex_);
-        file_id = next_file_id_++;
-    }
+    uint64_t file_id = AllocateFileId();
 
     const std::string sst_path = (std::filesystem::path(db_dir_) / ("sst_" + std::to_string(file_id) + ".sst")).string();
     SSTableBuilder builder(sst_path, bits_per_key_);
@@ -381,6 +385,11 @@ Status LevelManager::Flush(Iterator& iter) {
         }
         // Insert at the front of L0 (newest first)
         levels_[0].insert(levels_[0].begin(), meta);
+    }
+
+    {
+        std::lock_guard bg_lock(bg_mutex_);
+        bg_cv_.notify_one();
     }
 
     return Status::Ok();
@@ -548,6 +557,207 @@ Status LevelManager::DeleteFile(size_t level, uint64_t file_id) {
 
     if (block_cache_) {
         block_cache_->EvictFile(file_id);
+    }
+
+    return Status::Ok();
+}
+
+uint64_t LevelManager::TotalLevelSize(size_t level) const {
+    std::shared_lock lock(mutex_);
+    if (level >= levels_.size()) return 0;
+    uint64_t total = 0;
+    for (const auto& meta : levels_[level]) {
+        if (meta) total += meta->file_size;
+    }
+    return total;
+}
+
+uint64_t LevelManager::AllocateFileId() {
+    std::unique_lock lock(mutex_);
+    return next_file_id_++;
+}
+
+void LevelManager::StartBackgroundThread() {
+    bg_stopped_ = false;
+    bg_thread_ = std::thread(&LevelManager::BackgroundWorker, this);
+}
+
+void LevelManager::StopBackgroundThread() {
+    {
+        std::unique_lock lock(bg_mutex_);
+        if (bg_stopped_) return;
+        bg_stopped_ = true;
+        bg_cv_.notify_all();
+    }
+    if (bg_thread_.joinable()) {
+        bg_thread_.join();
+    }
+}
+
+void LevelManager::BackgroundWorker() {
+    while (!bg_stopped_.load()) {
+        std::unique_lock lock(bg_mutex_);
+        bg_cv_.wait(lock, [this] {
+            return bg_stopped_.load() || NeedsCompaction();
+        });
+        if (bg_stopped_.load()) {
+            break;
+        }
+
+        bg_compaction_running_ = true;
+        lock.unlock();
+
+        {
+            std::unique_lock comp_lock(compaction_mutex_);
+            while (!bg_stopped_.load()) {
+                auto job = Compactor::PickCompaction(*this, options_);
+                if (!job) break;
+                Status s = Compactor::RunCompaction(*this, options_, *job);
+                if (!s.ok()) break;
+            }
+        }
+
+        lock.lock();
+        bg_compaction_running_ = false;
+        bg_compaction_done_cv_.notify_all();
+    }
+}
+
+void LevelManager::WaitForCompaction() {
+    std::unique_lock lock(bg_mutex_);
+    bg_compaction_done_cv_.wait(lock, [this] {
+        return !bg_compaction_running_.load() && !NeedsCompaction();
+    });
+}
+
+bool LevelManager::NeedsCompaction() const {
+    std::shared_lock lock(mutex_);
+    if (levels_.empty()) return false;
+    if (levels_[0].size() >= options_.l0_trigger) {
+        return true;
+    }
+    for (size_t lvl = 1; lvl < levels_.size() - 1; ++lvl) {
+        if (lvl < options_.level_size_budget.size() && options_.level_size_budget[lvl] > 0) {
+            uint64_t sz = 0;
+            for (const auto& f : levels_[lvl]) {
+                if (f) sz += f->file_size;
+            }
+            if (sz >= options_.level_size_budget[lvl]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+Status LevelManager::CompactNow(Timestamp current_time) {
+    std::unique_lock comp_lock(compaction_mutex_);
+    auto job = Compactor::PickCompaction(*this, options_, current_time);
+    if (!job) {
+        return Status::Ok();
+    }
+    return Compactor::RunCompaction(*this, options_, *job);
+}
+
+Status LevelManager::CompactLevel(size_t level, Timestamp current_time) {
+    std::unique_lock comp_lock(compaction_mutex_);
+    auto job = Compactor::PickCompactionForLevel(*this, level, options_, current_time);
+    if (!job) {
+        return Status::Ok();
+    }
+    return Compactor::RunCompaction(*this, options_, *job);
+}
+
+Status LevelManager::ApplyCompactionEdit(
+    size_t from_level, size_t to_level,
+    const std::vector<std::shared_ptr<TableMeta>>& inputs_from,
+    const std::vector<std::shared_ptr<TableMeta>>& inputs_to,
+    const std::vector<std::shared_ptr<TableMeta>>& outputs) {
+
+    std::string manifest_records;
+    for (const auto& meta : outputs) {
+        manifest_records += "ADD_FILE " + std::to_string(to_level) + " " +
+                            std::to_string(meta->file_id) + " " +
+                            EncodeKeyHex(meta->min_key) + " " +
+                            EncodeKeyHex(meta->max_key) + " " +
+                            std::to_string(meta->max_version) + " " +
+                            std::to_string(meta->file_size) + "\n";
+    }
+    for (const auto& meta : inputs_from) {
+        manifest_records += "DELETE_FILE " + std::to_string(from_level) + " " +
+                            std::to_string(meta->file_id) + "\n";
+    }
+    for (const auto& meta : inputs_to) {
+        manifest_records += "DELETE_FILE " + std::to_string(to_level) + " " +
+                            std::to_string(meta->file_id) + "\n";
+    }
+
+    {
+        std::unique_lock lock(mutex_);
+        std::lock_guard m_lock(manifest_mutex_);
+
+        if (!manifest_records.empty()) {
+            int fd = open(manifest_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+            if (fd < 0) {
+                return Status::IOError("Failed to open MANIFEST for writing: " + std::string(strerror(errno)));
+            }
+            Status s = WriteBuffer(fd, manifest_records.data(), manifest_records.size());
+            if (!s.ok()) {
+                close(fd);
+                return s;
+            }
+            if (fsync(fd) != 0) {
+                close(fd);
+                return Status::IOError("Failed to fsync MANIFEST: " + std::string(strerror(errno)));
+            }
+            if (close(fd) != 0) {
+                return Status::IOError("Failed to close MANIFEST: " + std::string(strerror(errno)));
+            }
+        }
+
+        // Update in-memory levels_
+        if (from_level < levels_.size()) {
+            auto& files = levels_[from_level];
+            for (const auto& del : inputs_from) {
+                auto it = std::remove_if(files.begin(), files.end(),
+                                         [&](const auto& f) { return f->file_id == del->file_id; });
+                files.erase(it, files.end());
+            }
+        }
+        if (to_level < levels_.size()) {
+            auto& files = levels_[to_level];
+            for (const auto& del : inputs_to) {
+                auto it = std::remove_if(files.begin(), files.end(),
+                                         [&](const auto& f) { return f->file_id == del->file_id; });
+                files.erase(it, files.end());
+            }
+            for (const auto& out : outputs) {
+                files.push_back(out);
+            }
+            if (to_level == 0) {
+                std::sort(files.begin(), files.end(),
+                          [](const auto& a, const auto& b) { return a->file_id > b->file_id; });
+            } else {
+                std::sort(files.begin(), files.end(),
+                          [](const auto& a, const auto& b) { return a->min_key.user_key < b->min_key.user_key; });
+            }
+        }
+    }
+
+    auto delete_input_file = [&](const std::shared_ptr<TableMeta>& meta) {
+        if (!meta) return;
+        if (block_cache_) {
+            block_cache_->EvictFile(meta->file_id);
+        }
+        std::error_code ec;
+        std::filesystem::remove(meta->file_path, ec);
+    };
+
+    for (const auto& meta : inputs_from) {
+        delete_input_file(meta);
+    }
+    for (const auto& meta : inputs_to) {
+        delete_input_file(meta);
     }
 
     return Status::Ok();

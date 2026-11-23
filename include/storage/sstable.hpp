@@ -53,6 +53,7 @@ public:
     Timestamp max_version() const noexcept { return max_version_; }
     size_t entry_count() const noexcept { return entry_count_; }
     uint64_t file_size() const noexcept { return file_size_; }
+    uint64_t EstimatedSize() const noexcept { return current_file_offset_ + current_block_data_.size(); }
 
 private:
     Status FlushCurrentBlock();

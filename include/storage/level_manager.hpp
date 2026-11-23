@@ -4,8 +4,11 @@
 #include "kvstore/iterator.hpp"
 #include "kvstore/types.hpp"
 #include "storage/block_cache.hpp"
+#include "storage/compactor.hpp"
 #include "storage/sstable.hpp"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -14,6 +17,7 @@
 #include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace kvstore {
@@ -70,8 +74,9 @@ public:
     explicit LevelManager(std::string db_dir,
                           size_t block_cache_capacity = 8 * 1024 * 1024,
                           size_t max_levels = 7,
-                          size_t bits_per_key = 10);
-    ~LevelManager() override = default;
+                          size_t bits_per_key = 10,
+                          CompactionOptions options = {});
+    ~LevelManager() override;
 
     LevelManager(const LevelManager&) = delete;
     LevelManager& operator=(const LevelManager&) = delete;
@@ -91,27 +96,56 @@ public:
     size_t max_levels() const noexcept { return max_levels_; }
     size_t NumFiles(size_t level) const;
     std::vector<std::shared_ptr<TableMeta>> GetLevelFiles(size_t level) const;
+    uint64_t TotalLevelSize(size_t level) const;
 
     // Version edit operations
     Status AddFile(size_t level, std::shared_ptr<TableMeta> meta);
     Status DeleteFile(size_t level, uint64_t file_id);
+    uint64_t AllocateFileId();
+
+    // Compaction operations
+    Status ApplyCompactionEdit(size_t from_level, size_t to_level,
+                               const std::vector<std::shared_ptr<TableMeta>>& inputs_from,
+                               const std::vector<std::shared_ptr<TableMeta>>& inputs_to,
+                               const std::vector<std::shared_ptr<TableMeta>>& outputs);
+    Status CompactNow(Timestamp current_time = 0);
+    Status CompactLevel(size_t level, Timestamp current_time = 0);
+    void WaitForCompaction();
+    bool NeedsCompaction() const;
+
+    CompactionOptions& compaction_options() noexcept { return options_; }
+    const CompactionOptions& compaction_options() const noexcept { return options_; }
+    void SetCompactionOptions(const CompactionOptions& options) { options_ = options; }
+
+    void StartBackgroundThread();
+    void StopBackgroundThread();
 
 private:
     Status RecordAddFile(size_t level, const std::shared_ptr<TableMeta>& meta);
     Status RecordDeleteFile(size_t level, uint64_t file_id);
+    void BackgroundWorker();
 
     std::string db_dir_;
     std::string manifest_path_;
     size_t max_levels_{7};
     size_t bits_per_key_{10};
+    CompactionOptions options_;
 
     std::shared_ptr<BlockCache> block_cache_;
 
     mutable std::shared_mutex mutex_;
     std::mutex manifest_mutex_;
+    std::mutex compaction_mutex_;
 
     uint64_t next_file_id_{1};
     std::vector<std::vector<std::shared_ptr<TableMeta>>> levels_;
+
+    std::atomic<bool> bg_stopped_{false};
+    std::atomic<bool> bg_compaction_running_{false};
+    std::mutex bg_mutex_;
+    std::condition_variable bg_cv_;
+    std::condition_variable bg_compaction_done_cv_;
+    std::thread bg_thread_;
 };
 
 } // namespace kvstore
