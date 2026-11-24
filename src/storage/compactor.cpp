@@ -285,6 +285,12 @@ Status Compactor::RunCompaction(LevelManager& lm,
             stats->keys_retained++;
             stats->bytes_written += key.user_key.size() + value.size() + sizeof(uint64_t) + 1;
         }
+
+        // Rate-limiting throttle hook: query SmartScheduler
+        if (auto scheduler = lm.smart_scheduler()) {
+            size_t bytes_added = key.user_key.size() + value.size() + sizeof(uint64_t) + 1;
+            scheduler->Throttle(bytes_added, lm.NumFiles(0));
+        }
     }
 
     Status s = finish_current_builder();
