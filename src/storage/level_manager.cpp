@@ -165,13 +165,21 @@ LevelManager::LevelManager(std::string db_dir,
                            size_t block_cache_capacity,
                            size_t max_levels,
                            size_t bits_per_key,
-                           CompactionOptions options)
+                           CompactionOptions options,
+                           std::shared_ptr<LoadMonitor> load_monitor,
+                           std::shared_ptr<SmartScheduler> smart_scheduler)
     : db_dir_(std::move(db_dir)),
       manifest_path_((std::filesystem::path(db_dir_) / "MANIFEST").string()),
       max_levels_(max_levels),
       bits_per_key_(bits_per_key),
       options_(std::move(options)),
-      block_cache_(std::make_shared<BlockCache>(block_cache_capacity)) {
+      block_cache_(std::make_shared<BlockCache>(block_cache_capacity)),
+      load_monitor_(load_monitor ? std::move(load_monitor) : std::make_shared<LoadMonitor>()) {
+    if (smart_scheduler) {
+        smart_scheduler_ = std::move(smart_scheduler);
+    } else {
+        smart_scheduler_ = std::make_shared<SmartScheduler>(load_monitor_);
+    }
     options_.bits_per_key = bits_per_key_;
     levels_.resize(max_levels_);
     (void)Recover();
@@ -397,6 +405,8 @@ Status LevelManager::Flush(Iterator& iter) {
 
 Status LevelManager::GetAsOf(const std::string& key, Timestamp timestamp,
                              InternalKey* out_key, std::string* out_value) const {
+    ScopedRequestTimer timer(load_monitor_.get());
+
     if (!out_key || !out_value) {
         return {Status::Code::kInvalidArgument, "Output pointers cannot be null"};
     }
@@ -470,6 +480,8 @@ Status LevelManager::GetAsOf(const std::string& key, Timestamp timestamp,
 }
 
 std::unique_ptr<Iterator> LevelManager::NewIterator() const {
+    ScopedRequestTimer timer(load_monitor_.get());
+
     std::shared_lock lock(mutex_);
     std::vector<std::unique_ptr<Iterator>> children;
     std::vector<std::shared_ptr<TableMeta>> metas;
@@ -604,12 +616,35 @@ void LevelManager::BackgroundWorker() {
             break;
         }
 
+        // Consult SmartScheduler policy before running background compaction
+        if (smart_scheduler_) {
+            size_t l0_count = 0;
+            {
+                std::shared_lock sl(mutex_);
+                if (!levels_.empty()) l0_count = levels_[0].size();
+            }
+            auto policy = smart_scheduler_->EvaluatePolicy(l0_count);
+            if (!policy.should_run) {
+                // Background compaction paused due to busy foreground traffic
+                bg_cv_.wait_for(lock, std::chrono::milliseconds(50), [this] {
+                    return bg_stopped_.load();
+                });
+                if (bg_stopped_.load()) break;
+                continue;
+            }
+        }
+
         bg_compaction_running_ = true;
         lock.unlock();
 
         {
             std::unique_lock comp_lock(compaction_mutex_);
             while (!bg_stopped_.load()) {
+                if (smart_scheduler_) {
+                    size_t l0_count = NumFiles(0);
+                    auto policy = smart_scheduler_->EvaluatePolicy(l0_count);
+                    if (!policy.should_run) break;
+                }
                 auto job = Compactor::PickCompaction(*this, options_);
                 if (!job) break;
                 Status s = Compactor::RunCompaction(*this, options_, *job);

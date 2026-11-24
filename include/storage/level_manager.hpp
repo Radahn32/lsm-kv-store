@@ -5,6 +5,8 @@
 #include "kvstore/types.hpp"
 #include "storage/block_cache.hpp"
 #include "storage/compactor.hpp"
+#include "storage/load_monitor.hpp"
+#include "storage/smart_scheduler.hpp"
 #include "storage/sstable.hpp"
 
 #include <atomic>
@@ -75,7 +77,9 @@ public:
                           size_t block_cache_capacity = 8 * 1024 * 1024,
                           size_t max_levels = 7,
                           size_t bits_per_key = 10,
-                          CompactionOptions options = {});
+                          CompactionOptions options = {},
+                          std::shared_ptr<LoadMonitor> load_monitor = nullptr,
+                          std::shared_ptr<SmartScheduler> smart_scheduler = nullptr);
     ~LevelManager() override;
 
     LevelManager(const LevelManager&) = delete;
@@ -97,6 +101,15 @@ public:
     size_t NumFiles(size_t level) const;
     std::vector<std::shared_ptr<TableMeta>> GetLevelFiles(size_t level) const;
     uint64_t TotalLevelSize(size_t level) const;
+
+    // Telemetry & Scheduler accessors
+    LoadMonitor& GetLoadMonitor() noexcept { return *load_monitor_; }
+    const LoadMonitor& GetLoadMonitor() const noexcept { return *load_monitor_; }
+    std::shared_ptr<LoadMonitor> load_monitor() const noexcept { return load_monitor_; }
+
+    SmartScheduler& GetSmartScheduler() noexcept { return *smart_scheduler_; }
+    const SmartScheduler& GetSmartScheduler() const noexcept { return *smart_scheduler_; }
+    std::shared_ptr<SmartScheduler> smart_scheduler() const noexcept { return smart_scheduler_; }
 
     // Version edit operations
     Status AddFile(size_t level, std::shared_ptr<TableMeta> meta);
@@ -132,6 +145,8 @@ private:
     CompactionOptions options_;
 
     std::shared_ptr<BlockCache> block_cache_;
+    std::shared_ptr<LoadMonitor> load_monitor_;
+    std::shared_ptr<SmartScheduler> smart_scheduler_;
 
     mutable std::shared_mutex mutex_;
     std::mutex manifest_mutex_;
