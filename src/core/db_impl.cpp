@@ -89,6 +89,14 @@ Status DBImpl::OpenLocked() {
         return Status::Ok();
     }
 
+    if (!options_.vlog_dir.empty()) {
+        if (!vlog_) {
+            vlog_ = std::make_unique<VLog>(options_.vlog_dir, options_.vlog_max_segment_size);
+        }
+        Status vlog_status = vlog_->Open();
+        if (!vlog_status.ok()) return vlog_status;
+    }
+
     std::error_code ec;
     const bool has_legacy_wal = std::filesystem::exists(options_.wal_path, ec);
     if (ec) {
@@ -155,7 +163,15 @@ Status DBImpl::Write(const std::string& key, const std::string& value, ValueType
     }
 
     InternalKey internal_key{key, next_version_, type};
-    Status status = wal_->Append(internal_key, value);
+    std::string raw_value = value;
+    if (vlog_ && type == ValueType::kValue && value.size() >= options_.vlog_threshold) {
+        ValuePointer pointer;
+        Status status = vlog_->Append(key, next_version_, value, &pointer);
+        if (!status.ok()) return status;
+        internal_key.type = ValueType::kValuePointer;
+        raw_value = EncodeValuePointer(pointer);
+    }
+    Status status = wal_->Append(internal_key, raw_value);
     if (!status.ok()) {
         return status;
     }
@@ -166,36 +182,34 @@ Status DBImpl::Write(const std::string& key, const std::string& value, ValueType
         std::lock_guard state_lock(state_mutex_);
         active = active_;
     }
-    active->Put(internal_key, value);
+    active->Put(internal_key, std::move(raw_value));
+    return RotateIfNeededLocked(active);
+}
 
-    bool queued_flush = false;
-    if (active->ApproximateMemoryUsage() >= options_.memtable_limit) {
-        if (current_wal_id_ == std::numeric_limits<uint64_t>::max()) {
-            return Status::IOError("WAL segment ID exhausted");
-        }
-        const uint64_t next_id = current_wal_id_ + 1;
-        const std::string next_wal_path = NumberedWalPath(options_.wal_path, next_id);
-        auto next_wal = std::make_unique<WAL>(next_wal_path);
-        status = next_wal->Open();
-        if (!status.ok()) return status;
+Status DBImpl::RotateIfNeededLocked(const std::shared_ptr<MemTable>& active) {
+    if (active->ApproximateMemoryUsage() < options_.memtable_limit) return Status::Ok();
+    if (current_wal_id_ == std::numeric_limits<uint64_t>::max()) {
+        return Status::IOError("WAL segment ID exhausted");
+    }
+    const uint64_t next_id = current_wal_id_ + 1;
+    const std::string next_wal_path = NumberedWalPath(options_.wal_path, next_id);
+    auto next_wal = std::make_unique<WAL>(next_wal_path);
+    Status status = next_wal->Open();
+    if (!status.ok()) return status;
 
-        // writer_mutex_ excludes appenders, so the old WAL is closed before ownership
-        // of its paths moves to the immutable table.
-        wal_.reset();
-        {
-            std::lock_guard flush_lock(flush_mutex_);
-            std::lock_guard state_lock(state_mutex_);
-            immutable_.push_back({active_, std::move(active_wal_paths_)});
-            active_ = std::make_shared<MemTable>();
-            wal_ = std::move(next_wal);
-            current_wal_id_ = next_id;
-            active_wal_paths_ = {next_wal_path};
-            queued_flush = true;
-        }
+    // writer_mutex_ excludes appenders, so the old WAL is closed before ownership
+    // of its paths moves to the immutable table.
+    wal_.reset();
+    {
+        std::lock_guard flush_lock(flush_mutex_);
+        std::lock_guard state_lock(state_mutex_);
+        immutable_.push_back({active_, std::move(active_wal_paths_)});
+        active_ = std::make_shared<MemTable>();
+        wal_ = std::move(next_wal);
+        current_wal_id_ = next_id;
+        active_wal_paths_ = {next_wal_path};
     }
-    if (queued_flush) {
-        flush_cv_.notify_one();
-    }
+    flush_cv_.notify_one();
     return Status::Ok();
 }
 
@@ -212,6 +226,28 @@ Status DBImpl::ReadAt(const std::string& key, Timestamp timestamp, std::string* 
         return {Status::Code::kInvalidArgument, "value output must not be null"};
     }
 
+    std::shared_lock gc_lock(vlog_gc_mutex_);
+    InternalKey winning_key;
+    std::string raw_value;
+    Status status = LookupRawAt(key, timestamp, &winning_key, &raw_value);
+    if (!status.ok()) return status;
+    if (winning_key.type == ValueType::kTombstone) return Status::NotFound();
+    if (winning_key.type == ValueType::kValuePointer) {
+        if (!vlog_) return Status::Corruption("value pointer found while vLog is disabled");
+        ValuePointer pointer;
+        status = DecodeValuePointer(raw_value, &pointer);
+        if (!status.ok()) return status;
+        return vlog_->Read(pointer, value);
+    }
+    *value = std::move(raw_value);
+    return Status::Ok();
+}
+
+Status DBImpl::LookupRawAt(const std::string& key, Timestamp timestamp,
+                           InternalKey* out_key, std::string* out_raw_value) const {
+    if (!out_key || !out_raw_value) {
+        return {Status::Code::kInvalidArgument, "raw lookup outputs must not be null"};
+    }
     std::shared_ptr<MemTable> active;
     std::vector<ImmutableEntry> immutable;
     {
@@ -221,8 +257,8 @@ Status DBImpl::ReadAt(const std::string& key, Timestamp timestamp, std::string* 
     }
 
     bool found = false;
-    bool deleted = false;
     Timestamp best_version = 0;
+    InternalKey best_key;
     std::string best_value;
     const auto consider = [&](const std::shared_ptr<MemTable>& table) {
         auto iterator = table->NewIterator();
@@ -230,16 +266,15 @@ Status DBImpl::ReadAt(const std::string& key, Timestamp timestamp, std::string* 
         if (iterator->Valid() && iterator->Key().user_key == key &&
             iterator->Key().version <= timestamp &&
             (!found || iterator->Key().version > best_version)) {
-            const InternalKey internal_key = iterator->Key();
+            best_key = iterator->Key();
             found = true;
-            best_version = internal_key.version;
-            deleted = internal_key.type == ValueType::kTombstone;
+            best_version = best_key.version;
             best_value = std::string(iterator->Value());
         }
     };
     consider(active);
-    for (const auto& entry : immutable) {
-        consider(entry.table);
+    for (auto entry = immutable.rbegin(); entry != immutable.rend(); ++entry) {
+        consider(entry->table);
     }
 
     if (options_.disk) {
@@ -249,17 +284,16 @@ Status DBImpl::ReadAt(const std::string& key, Timestamp timestamp, std::string* 
         if (status.ok() && (!found || disk_key.version > best_version)) {
             found = true;
             best_version = disk_key.version;
-            deleted = disk_key.type == ValueType::kTombstone;
+            best_key = disk_key;
             best_value = std::move(disk_value);
         } else if (!status.ok() && !status.is_not_found()) {
             return status;
         }
     }
 
-    if (!found || deleted) {
-        return Status::NotFound();
-    }
-    *value = std::move(best_value);
+    if (!found) return Status::NotFound();
+    *out_key = std::move(best_key);
+    *out_raw_value = std::move(best_value);
     return Status::Ok();
 }
 
@@ -305,8 +339,10 @@ Status DBImpl::Scan(const std::string& start_key, const std::string& end_key,
     std::shared_ptr<MemTable> active;
     std::vector<ImmutableEntry> immutable;
     Timestamp read_timestamp;
+    std::shared_lock<std::shared_mutex> gc_lock;
     {
         std::lock_guard writer_lock(writer_mutex_);
+        gc_lock = std::shared_lock<std::shared_mutex>(vlog_gc_mutex_);
         std::lock_guard state_lock(state_mutex_);
         active = active_;
         immutable = immutable_;
@@ -314,49 +350,118 @@ Status DBImpl::Scan(const std::string& start_key, const std::string& end_key,
     }
 
     std::map<std::string, std::pair<InternalKey, std::string>> merged;
-    for (const auto& entry : immutable) {
-        auto iterator = entry.table->NewIterator();
-        for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
-            InternalKey key = iterator->Key();
+    const auto merge_iterator = [&](Iterator& iterator) {
+        for (iterator.SeekToFirst(); iterator.Valid(); iterator.Next()) {
+            InternalKey key = iterator.Key();
             if (key.user_key < start_key || (!end_key.empty() && key.user_key >= end_key) ||
                 key.version > read_timestamp) continue;
             auto& current = merged[key.user_key];
-            if (current.first.version < key.version) current = {key, std::string(iterator->Value())};
-        }
-    }
-    {
-        auto iterator = active->NewIterator();
-        for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
-            InternalKey key = iterator->Key();
-            if (key.user_key < start_key || (!end_key.empty() && key.user_key >= end_key) ||
-                key.version > read_timestamp) continue;
-            auto& current = merged[key.user_key];
-            if (current.first.version < key.version) current = {key, std::string(iterator->Value())};
-        }
-    }
-
-    // The snapshot tables above are fixed. The iterator is consumed synchronously without
-    // holding any MemTable lock, so slow disk traversal does not block writers.
-    if (options_.disk) {
-        auto iterator = options_.disk->NewIterator();
-        if (iterator) {
-            for (iterator->SeekToFirst(); iterator->Valid(); iterator->Next()) {
-                InternalKey key = iterator->Key();
-                if (key.user_key < start_key || (!end_key.empty() && key.user_key >= end_key) ||
-                    key.version > read_timestamp) continue;
-                auto& current = merged[key.user_key];
-                if (current.first.version < key.version) {
-                    current = {key, std::string(iterator->Value())};
-                }
+            if (current.first.version < key.version) {
+                current = {key, std::string(iterator.Value())};
             }
         }
+    };
+
+    // Process the highest-priority source first so the first equal-version entry wins.
+    {
+        auto iterator = active->NewIterator();
+        merge_iterator(*iterator);
+    }
+    for (auto entry = immutable.rbegin(); entry != immutable.rend(); ++entry) {
+        auto iterator = entry->table->NewIterator();
+        merge_iterator(*iterator);
+    }
+    if (options_.disk) {
+        auto iterator = options_.disk->NewIterator();
+        if (iterator) merge_iterator(*iterator);
     }
 
     results->clear();
     for (auto& [key, entry] : merged) {
         if (entry.first.version != 0 && entry.first.type != ValueType::kTombstone) {
-            results->emplace_back(key, std::move(entry.second));
+            std::string value = std::move(entry.second);
+            if (entry.first.type == ValueType::kValuePointer) {
+                if (!vlog_) return Status::Corruption("value pointer found while vLog is disabled");
+                ValuePointer pointer;
+                Status status = DecodeValuePointer(value, &pointer);
+                if (!status.ok()) return status;
+                status = vlog_->Read(pointer, &value);
+                if (!status.ok()) return status;
+            }
+            results->emplace_back(key, std::move(value));
         }
+    }
+    return Status::Ok();
+}
+
+Status DBImpl::RunVLogGC(Timestamp min_retained_ts, VLogGCStats* stats) {
+    std::lock_guard writer_lock(writer_mutex_);
+    Status status = OpenLocked();
+    if (!status.ok()) return status;
+    if (stats) *stats = {};
+    if (!vlog_) return Status::Ok();
+
+    const auto sealed_segments = vlog_->SealedSegmentIds();
+    for (uint32_t segment_id : sealed_segments) {
+        status = vlog_->ScanSegment(segment_id, [&](const VLogRecord& record) {
+            const auto points_to_record = [&](Timestamp timestamp) -> Status {
+                InternalKey key;
+                std::string raw_value;
+                Status lookup_status = LookupRawAt(record.user_key, timestamp, &key, &raw_value);
+                if (!lookup_status.ok()) return lookup_status;
+                if (key.version != record.version || key.type != ValueType::kValuePointer) {
+                    return Status::NotFound();
+                }
+                ValuePointer pointer;
+                lookup_status = DecodeValuePointer(raw_value, &pointer);
+                if (!lookup_status.ok()) return lookup_status;
+                if (pointer.file_id == record.pointer.file_id &&
+                    pointer.offset == record.pointer.offset &&
+                    pointer.size == record.pointer.size) {
+                    return Status::Ok();
+                }
+                return Status::NotFound();
+            };
+
+            Status live_status = points_to_record(std::numeric_limits<Timestamp>::max());
+            bool live = live_status.ok();
+            if (!live && !live_status.is_not_found()) return live_status;
+            if (!live && min_retained_ts > 0 && record.version >= min_retained_ts) {
+                live_status = points_to_record(record.version);
+                live = live_status.ok();
+                if (!live && !live_status.is_not_found()) return live_status;
+            }
+            if (!live) {
+                if (stats) ++stats->records_dropped;
+                return Status::Ok();
+            }
+
+            ValuePointer new_pointer;
+            Status append_status = vlog_->Append(record.user_key, record.version,
+                                                 record.value, &new_pointer);
+            if (!append_status.ok()) return append_status;
+            const InternalKey pointer_key{record.user_key, record.version,
+                                          ValueType::kValuePointer};
+            const std::string encoded_pointer = EncodeValuePointer(new_pointer);
+            append_status = wal_->Append(pointer_key, encoded_pointer);
+            if (!append_status.ok()) return append_status;
+
+            std::shared_ptr<MemTable> active;
+            {
+                std::lock_guard state_lock(state_mutex_);
+                active = active_;
+            }
+            active->Put(pointer_key, encoded_pointer);
+            if (stats) ++stats->records_relocated;
+            return RotateIfNeededLocked(active);
+        });
+        if (!status.ok()) return status;
+        {
+            std::unique_lock gc_lock(vlog_gc_mutex_);
+            status = vlog_->RemoveSegment(segment_id);
+        }
+        if (!status.ok()) return status;
+        if (stats) ++stats->segments_reclaimed;
     }
     return Status::Ok();
 }

@@ -3,6 +3,7 @@
 #include "kvstore/db.hpp"
 #include "kvstore/memtable.hpp"
 #include "kvstore/wal.hpp"
+#include "kvstore/vlog.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
 
@@ -29,6 +31,15 @@ struct DBOptions {
     std::string wal_path;
     std::size_t memtable_limit = 4U * 1024U * 1024U;
     std::shared_ptr<DiskStorage> disk;
+    std::string vlog_dir;
+    std::size_t vlog_threshold = 1024;
+    std::size_t vlog_max_segment_size = 16U * 1024U * 1024U;
+};
+
+struct VLogGCStats {
+    uint64_t segments_reclaimed = 0;
+    uint64_t records_relocated = 0;
+    uint64_t records_dropped = 0;
 };
 
 class DBImpl final : public DB {
@@ -44,6 +55,7 @@ public:
     Status GetAsOf(const std::string&, Timestamp, std::string*) override;
     Status Diff(const std::string&, Timestamp, Timestamp, DiffResult*) override;
     Status WaitForFlush();
+    Status RunVLogGC(Timestamp min_retained_ts = 0, VLogGCStats* stats = nullptr);
 
 private:
     struct ImmutableEntry {
@@ -54,11 +66,15 @@ private:
     Status Write(const std::string&, const std::string&, ValueType);
     Status OpenLocked();
     Status ReadAt(const std::string&, Timestamp, std::string*) const;
+    Status LookupRawAt(const std::string&, Timestamp, InternalKey*, std::string*) const;
+    Status RotateIfNeededLocked(const std::shared_ptr<MemTable>& active);
     void FlushWorker();
     DBOptions options_;
+    std::unique_ptr<VLog> vlog_;
     std::unique_ptr<WAL> wal_;
     uint64_t current_wal_id_ = 0;
     std::vector<std::string> active_wal_paths_;
+    mutable std::shared_mutex vlog_gc_mutex_;
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     std::shared_ptr<MemTable> active_;

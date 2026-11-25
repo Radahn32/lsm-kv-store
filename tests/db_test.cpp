@@ -1,4 +1,5 @@
 #include "kvstore/db_impl.hpp"
+#include "storage/level_manager.hpp"
 
 #include <gtest/gtest.h>
 
@@ -88,6 +89,8 @@ public:
     ~Fixture() {
         std::error_code ec;
         std::filesystem::remove(path_, ec);
+        std::filesystem::remove_all(path_ + ".vlog", ec);
+        std::filesystem::remove_all(path_ + ".disk", ec);
         const std::filesystem::path base(path_);
         const auto parent = base.has_parent_path() ? base.parent_path() : std::filesystem::path(".");
         const std::string prefix = base.filename().string() + ".";
@@ -101,7 +104,7 @@ public:
         }
     }
     DBOptions Options(std::shared_ptr<DiskStorage> disk = {}, std::size_t limit = 100000) const {
-        return {path_, limit, std::move(disk)};
+        return {path_, limit, std::move(disk), {}, 1024, 16U * 1024U * 1024U};
     }
     const std::string& Path() const { return path_; }
 private:
@@ -336,6 +339,215 @@ TEST(DBTest, RejectsNullOutputs) {
     DBImpl db(fixture.Options());
     EXPECT_EQ(db.Get("x", nullptr).code, Status::Code::kInvalidArgument);
     EXPECT_EQ(db.Diff("x", 1, 2, nullptr).code, Status::Code::kInvalidArgument);
+}
+
+TEST(DBTest, VLogValuesSupportReadsTimeTravelScanAndReopen) {
+    Fixture fixture;
+    DBOptions options = fixture.Options();
+    options.vlog_dir = fixture.Path() + ".vlog";
+    options.vlog_threshold = 8;
+    std::string large_value = "large-value";
+    {
+        DBImpl db(options);
+        ASSERT_TRUE(db.Open().ok());
+        ASSERT_TRUE(db.Put("small", "tiny").ok());
+        ASSERT_TRUE(db.Put("large", large_value).ok());
+        ASSERT_TRUE(db.Put("large", "second-large-value").ok());
+
+        std::string value;
+        ASSERT_TRUE(db.Get("small", &value).ok());
+        EXPECT_EQ(value, "tiny");
+        ASSERT_TRUE(db.GetAsOf("large", 2, &value).ok());
+        EXPECT_EQ(value, large_value);
+        DiffResult diff;
+        ASSERT_TRUE(db.Diff("large", 2, 3, &diff).ok());
+        EXPECT_TRUE(diff.changed);
+        EXPECT_EQ(diff.old_value, std::optional<std::string>(large_value));
+        EXPECT_EQ(diff.new_value, std::optional<std::string>("second-large-value"));
+
+        std::vector<std::pair<std::string, std::string>> rows;
+        ASSERT_TRUE(db.Scan("", "", &rows).ok());
+        ASSERT_EQ(rows.size(), 2U);
+        EXPECT_EQ(rows[0], (std::pair<std::string, std::string>{"large", "second-large-value"}));
+    }
+    {
+        VLog vlog(options.vlog_dir, options.vlog_max_segment_size);
+        ASSERT_TRUE(vlog.Open().ok());
+        std::vector<VLogRecord> records;
+        ASSERT_TRUE(vlog.ScanSegment(1, [&](const VLogRecord& record) {
+            records.push_back(record);
+            return Status::Ok();
+        }).ok());
+        ASSERT_EQ(records.size(), 2U);
+        EXPECT_EQ(records[0].user_key, "large");
+        EXPECT_EQ(records[1].user_key, "large");
+    }
+    {
+        DBImpl reopened(options);
+        ASSERT_TRUE(reopened.Open().ok());
+        std::string value;
+        ASSERT_TRUE(reopened.Get("large", &value).ok());
+        EXPECT_EQ(value, "second-large-value");
+        ASSERT_TRUE(reopened.GetAsOf("large", 2, &value).ok());
+        EXPECT_EQ(value, large_value);
+    }
+}
+
+TEST(DBTest, VLogGCReclaimsDeadRecordsAndRelocatesLiveValues) {
+    Fixture fixture;
+    DBOptions options = fixture.Options();
+    options.vlog_dir = fixture.Path() + ".vlog";
+    options.vlog_threshold = 1;
+    options.vlog_max_segment_size = 35;
+    DBImpl db(options);
+    ASSERT_TRUE(db.Open().ok());
+    ASSERT_TRUE(db.Put("live", "large-value-one").ok());
+    ASSERT_TRUE(db.Put("other", "large-value-other").ok());
+    ASSERT_TRUE(db.Put("live", "large-value-two").ok());
+    ASSERT_TRUE(db.Delete("other").ok());
+    ASSERT_TRUE(db.Put("tail", "large-value-tail").ok());
+
+    VLogGCStats stats;
+    ASSERT_TRUE(db.RunVLogGC(0, &stats).ok());
+    EXPECT_EQ(stats.segments_reclaimed, 3U);
+    EXPECT_EQ(stats.records_relocated, 1U);
+    EXPECT_EQ(stats.records_dropped, 2U);
+
+    std::string value;
+    ASSERT_TRUE(db.Get("live", &value).ok());
+    EXPECT_EQ(value, "large-value-two");
+    std::vector<std::pair<std::string, std::string>> rows;
+    ASSERT_TRUE(db.Scan("", "", &rows).ok());
+    ASSERT_EQ(rows.size(), 2U);
+    EXPECT_EQ(rows[0], (std::pair<std::string, std::string>{"live", "large-value-two"}));
+    EXPECT_EQ(rows[1], (std::pair<std::string, std::string>{"tail", "large-value-tail"}));
+}
+
+TEST(DBTest, VLogGCPreservesHistoryAtOrAboveRetentionTimestamp) {
+    Fixture fixture;
+    DBOptions options = fixture.Options();
+    options.vlog_dir = fixture.Path() + ".vlog";
+    options.vlog_threshold = 1;
+    options.vlog_max_segment_size = 35;
+    DBImpl db(options);
+    ASSERT_TRUE(db.Put("key", "large-value-one").ok());
+    ASSERT_TRUE(db.Put("key", "large-value-two").ok());
+    ASSERT_TRUE(db.Put("key", "large-value-three").ok());
+
+    VLogGCStats stats;
+    ASSERT_TRUE(db.RunVLogGC(2, &stats).ok());
+    EXPECT_EQ(stats.segments_reclaimed, 2U);
+    EXPECT_EQ(stats.records_relocated, 1U);
+    EXPECT_EQ(stats.records_dropped, 1U);
+    std::string value;
+    ASSERT_TRUE(db.GetAsOf("key", 2, &value).ok());
+    EXPECT_EQ(value, "large-value-two");
+    ASSERT_TRUE(db.GetAsOf("key", 3, &value).ok());
+    EXPECT_EQ(value, "large-value-three");
+}
+
+TEST(DBTest, VLogPointersSurviveLevelManagerFlushAndGarbageCollection) {
+    Fixture fixture;
+    const std::string disk_dir = fixture.Path() + ".disk";
+    DBOptions options = fixture.Options(std::make_shared<LevelManager>(disk_dir, 1024 * 1024), 100);
+    options.vlog_dir = fixture.Path() + ".vlog";
+    options.vlog_threshold = 1;
+    options.vlog_max_segment_size = 35;
+    {
+        DBImpl db(options);
+        ASSERT_TRUE(db.Open().ok());
+        ASSERT_TRUE(db.Put("key", "large-value-one").ok());
+        ASSERT_TRUE(db.Put("key", "large-value-two").ok());
+        ASSERT_TRUE(db.Put("dummy", "large-value-dummy").ok());
+        ASSERT_TRUE(db.Delete("dummy").ok());
+        ASSERT_TRUE(db.WaitForFlush().ok());
+        VLogGCStats stats;
+        ASSERT_TRUE(db.RunVLogGC(0, &stats).ok());
+        EXPECT_EQ(stats.segments_reclaimed, 2U);
+        EXPECT_EQ(stats.records_relocated, 1U);
+        std::string value;
+        ASSERT_TRUE(db.Get("key", &value).ok());
+        EXPECT_EQ(value, "large-value-two");
+    }
+    options.disk = std::make_shared<LevelManager>(disk_dir, 1024 * 1024);
+    DBImpl reopened(options);
+    ASSERT_TRUE(reopened.Open().ok());
+    std::string value;
+    ASSERT_TRUE(reopened.Get("key", &value).ok());
+    EXPECT_EQ(value, "large-value-two");
+    std::vector<std::pair<std::string, std::string>> rows;
+    const Status scan_status = reopened.Scan("", "", &rows);
+    ASSERT_TRUE(scan_status.ok()) << scan_status.message;
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(rows[0], (std::pair<std::string, std::string>{"key", "large-value-two"}));
+}
+
+TEST(DBTest, VLogConcurrentReadersDuringGC) {
+    Fixture fixture;
+    DBOptions options = fixture.Options({}, 1024 * 1024);
+    options.vlog_dir = fixture.Path() + ".vlog";
+    options.vlog_threshold = 1;
+    options.vlog_max_segment_size = 50;
+    DBImpl db(options);
+    ASSERT_TRUE(db.Open().ok());
+
+    const std::vector<std::string> keys = {"k0", "k1", "k2"};
+    const auto make_value = [](const std::string& key, int generation) {
+        return "payload-" + key + "-" + std::to_string(generation);
+    };
+    const auto is_known_value = [&](const std::string& key, const std::string& value) {
+        for (int generation = 0; generation <= 12; ++generation) {
+            if (value == make_value(key, generation)) return true;
+        }
+        return false;
+    };
+    for (const auto& key : keys) ASSERT_TRUE(db.Put(key, make_value(key, 0)).ok());
+
+    std::atomic<bool> finished = false;
+    std::atomic<bool> failed = false;
+    std::thread reader([&] {
+        do {
+            for (const auto& key : keys) {
+                std::string value;
+                const Status status = db.Get(key, &value);
+                if (!status.ok() || !is_known_value(key, value)) failed = true;
+            }
+            std::vector<std::pair<std::string, std::string>> rows;
+            const Status scan_status = db.Scan("", "", &rows);
+            if (!scan_status.ok() || rows.size() != keys.size()) {
+                failed = true;
+            } else {
+                for (const auto& [key, value] : rows) {
+                    if (std::find(keys.begin(), keys.end(), key) == keys.end() ||
+                        !is_known_value(key, value)) {
+                        failed = true;
+                    }
+                }
+            }
+        } while (!finished.load());
+    });
+
+    for (int generation = 1; generation <= 12; ++generation) {
+        for (const auto& key : keys) {
+            if (!db.Put(key, make_value(key, generation)).ok()) {
+                failed = true;
+                break;
+            }
+        }
+        if (!db.RunVLogGC().ok()) {
+            failed = true;
+            break;
+        }
+    }
+    finished = true;
+    reader.join();
+    EXPECT_FALSE(failed.load());
+
+    for (const auto& key : keys) {
+        std::string value;
+        ASSERT_TRUE(db.Get(key, &value).ok());
+        EXPECT_EQ(value, make_value(key, 12));
+    }
 }
 
 } // namespace
