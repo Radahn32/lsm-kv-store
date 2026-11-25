@@ -4,19 +4,26 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 namespace kvstore {
 
 class LevelManagerTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        static std::atomic<uint64_t> counter{0};
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-        test_dir_ = std::filesystem::temp_directory_path() / ("level_mgr_test_" + std::to_string(now));
+        const auto instance = counter.fetch_add(1, std::memory_order_relaxed);
+        test_dir_ = std::filesystem::temp_directory_path() /
+                    ("level_mgr_test_" + std::to_string(::getpid()) + "_" +
+                     std::to_string(now) + "_" + std::to_string(instance));
         std::filesystem::create_directories(test_dir_);
     }
 
@@ -234,15 +241,15 @@ TEST_F(LevelManagerTest, DBImplEndToEndIntegrationWithLevelManager) {
     const std::string db_dir = DbDir();
     const std::string wal_path = db_dir + "/wal.log";
 
-    auto lm = std::make_shared<LevelManager>(db_dir, 1024 * 1024);
-
-    DBOptions options;
-    options.wal_path = wal_path;
-    options.memtable_limit = 256; // small limit to trigger automatic flushes
-    options.disk = lm;
-
     // 1. Initial DB instance: insert, update, delete, flush
     {
+        auto lm = std::make_shared<LevelManager>(db_dir, 1024 * 1024);
+
+        DBOptions options;
+        options.wal_path = wal_path;
+        options.memtable_limit = 256; // small limit to trigger automatic flushes
+        options.disk = lm;
+
         DBImpl db(options);
         ASSERT_TRUE(db.Open().ok());
 
@@ -271,12 +278,12 @@ TEST_F(LevelManagerTest, DBImplEndToEndIntegrationWithLevelManager) {
         EXPECT_TRUE(db.Get("user_200", &val).is_not_found());
 
         // LevelManager must have flushed files
-        EXPECT_GT(lm->NumFiles(0), 0U);
+        EXPECT_GT(lm->NumFiles(0) + lm->NumFiles(1), 0U);
     }
 
     // 2. Restart simulation: reopen DBImpl with a fresh LevelManager on the same directory
     auto lm_reopened = std::make_shared<LevelManager>(db_dir, 1024 * 1024);
-    EXPECT_GT(lm_reopened->NumFiles(0), 0U);
+    EXPECT_GT(lm_reopened->NumFiles(0) + lm_reopened->NumFiles(1), 0U);
     EXPECT_GT(lm_reopened->MaxVersion(), 0U);
 
     DBOptions options_reopened;

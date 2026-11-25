@@ -6,11 +6,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 namespace kvstore {
 
@@ -171,8 +173,12 @@ TEST(BlockCacheTest, ConcurrentReadsAndWritesMultiThreaded) {
 }
 
 TEST(BlockCacheTest, SSTableReaderIntegrationWithBlockCache) {
+    static std::atomic<uint64_t> counter{0};
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    const auto temp_dir = std::filesystem::temp_directory_path() / ("block_cache_sst_" + std::to_string(now));
+    const auto instance = counter.fetch_add(1, std::memory_order_relaxed);
+    const auto temp_dir = std::filesystem::temp_directory_path() /
+                          ("block_cache_sst_" + std::to_string(::getpid()) + "_" +
+                           std::to_string(now) + "_" + std::to_string(instance));
     std::filesystem::create_directories(temp_dir);
     const std::string sst_path = (temp_dir / "table.sst").string();
 
