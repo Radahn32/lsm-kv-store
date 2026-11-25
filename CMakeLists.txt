@@ -31,6 +31,9 @@ list(FILTER KVSTORE_SOURCES EXCLUDE REGEX ".*/main\\.cpp$")
 add_library(kvstore_core ${KVSTORE_SOURCES})
 target_include_directories(kvstore_core PUBLIC include)
 
+add_executable(kvstore_cli src/cli/main.cpp)
+target_link_libraries(kvstore_cli PRIVATE kvstore_core)
+
 # Auto-discover test executables
 file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")
 
