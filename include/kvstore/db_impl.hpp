@@ -6,10 +6,12 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <memory>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace kvstore {
 
@@ -44,16 +46,23 @@ public:
     Status WaitForFlush();
 
 private:
+    struct ImmutableEntry {
+        std::shared_ptr<MemTable> table;
+        std::vector<std::string> wal_paths;
+    };
+
     Status Write(const std::string&, const std::string&, ValueType);
     Status OpenLocked();
     Status ReadAt(const std::string&, Timestamp, std::string*) const;
     void FlushWorker();
     DBOptions options_;
-    WAL wal_;
+    std::unique_ptr<WAL> wal_;
+    uint64_t current_wal_id_ = 0;
+    std::vector<std::string> active_wal_paths_;
     mutable std::mutex state_mutex_;
     std::mutex writer_mutex_;
     std::shared_ptr<MemTable> active_;
-    std::vector<std::shared_ptr<MemTable>> immutable_;
+    std::vector<ImmutableEntry> immutable_;
     Timestamp next_version_ = 1;
     bool opened_ = false;
     bool stopping_ = false;

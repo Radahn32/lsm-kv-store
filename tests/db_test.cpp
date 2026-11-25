@@ -85,10 +85,25 @@ class Fixture {
 public:
     Fixture() : path_("/tmp/db-test-" + std::to_string(::getpid()) + "-" +
                       std::to_string(++counter_) + ".wal") {}
-    ~Fixture() { std::filesystem::remove(path_); }
+    ~Fixture() {
+        std::error_code ec;
+        std::filesystem::remove(path_, ec);
+        const std::filesystem::path base(path_);
+        const auto parent = base.has_parent_path() ? base.parent_path() : std::filesystem::path(".");
+        const std::string prefix = base.filename().string() + ".";
+        for (std::filesystem::directory_iterator it(parent, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string filename = it->path().filename().string();
+            if (filename.size() > prefix.size() &&
+                filename.compare(0, prefix.size(), prefix) == 0) {
+                std::filesystem::remove(it->path(), ec);
+                ec.clear();
+            }
+        }
+    }
     DBOptions Options(std::shared_ptr<DiskStorage> disk = {}, std::size_t limit = 100000) const {
         return {path_, limit, std::move(disk)};
     }
+    const std::string& Path() const { return path_; }
 private:
     std::string path_;
     static inline int counter_ = 0;
@@ -203,6 +218,95 @@ TEST(DBTest, FlushErrorsWakeWaiterAndAreReturned) {
     Status status = db.WaitForFlush();
     EXPECT_EQ(status.code, Status::Code::kIOError);
     EXPECT_NE(status.message.find("injected"), std::string::npos);
+}
+
+TEST(DBTest, FlushRotatesWalAndDeletesFlushedSegment) {
+    Fixture fixture;
+    auto disk = std::make_shared<DiskMock>();
+    DBImpl db(fixture.Options(disk, 1));
+    ASSERT_TRUE(db.Put("key", "value").ok());
+    ASSERT_TRUE(db.WaitForFlush().ok());
+
+    EXPECT_FALSE(std::filesystem::exists(fixture.Path() + ".000001"));
+    EXPECT_TRUE(std::filesystem::exists(fixture.Path() + ".000002"));
+}
+
+TEST(DBTest, FailedFlushPreservesWalAndReopeningRecoversWrites) {
+    Fixture fixture;
+    auto disk = std::make_shared<DiskMock>();
+    disk->FailFlush(true);
+    {
+        DBImpl db(fixture.Options(disk, 1));
+        ASSERT_TRUE(db.Put("key", "value").ok());
+        EXPECT_FALSE(db.WaitForFlush().ok());
+    }
+    EXPECT_TRUE(std::filesystem::exists(fixture.Path() + ".000001"));
+
+    disk->FailFlush(false);
+    DBImpl reopened(fixture.Options(disk));
+    ASSERT_TRUE(reopened.Open().ok());
+    std::string value;
+    ASSERT_TRUE(reopened.Get("key", &value).ok());
+    EXPECT_EQ(value, "value");
+}
+
+TEST(DBTest, ReplaysMultipleWalSegmentsInOrderAndCleansThemAfterFlush) {
+    Fixture fixture;
+    auto disk = std::make_shared<DiskMock>();
+    disk->FailFlush(true);
+    {
+        DBImpl db(fixture.Options(disk, 1));
+        ASSERT_TRUE(db.Put("first", "one").ok());
+        EXPECT_FALSE(db.WaitForFlush().ok());
+        ASSERT_TRUE(db.Put("second", "two").ok());
+        ASSERT_TRUE(db.Put("third", "three").ok());
+    }
+    ASSERT_TRUE(std::filesystem::exists(fixture.Path() + ".000001"));
+    ASSERT_TRUE(std::filesystem::exists(fixture.Path() + ".000002"));
+    ASSERT_TRUE(std::filesystem::exists(fixture.Path() + ".000003"));
+
+    disk->FailFlush(false);
+    DBImpl reopened(fixture.Options(disk, 1));
+    ASSERT_TRUE(reopened.Open().ok());
+    std::string value;
+    ASSERT_TRUE(reopened.GetAsOf("first", 1, &value).ok());
+    EXPECT_EQ(value, "one");
+    ASSERT_TRUE(reopened.GetAsOf("second", 2, &value).ok());
+    EXPECT_EQ(value, "two");
+    ASSERT_TRUE(reopened.GetAsOf("third", 3, &value).ok());
+    EXPECT_EQ(value, "three");
+    ASSERT_TRUE(reopened.Put("trigger", "flush").ok());
+    ASSERT_TRUE(reopened.WaitForFlush().ok());
+
+    EXPECT_FALSE(std::filesystem::exists(fixture.Path() + ".000001"));
+    EXPECT_FALSE(std::filesystem::exists(fixture.Path() + ".000002"));
+    EXPECT_FALSE(std::filesystem::exists(fixture.Path() + ".000003"));
+    EXPECT_FALSE(std::filesystem::exists(fixture.Path() + ".000004"));
+    EXPECT_TRUE(std::filesystem::exists(fixture.Path() + ".000005"));
+}
+
+TEST(DBTest, InMemoryModePreservesRotatedWalSegmentsForRecovery) {
+    Fixture fixture;
+    {
+        DBImpl db(fixture.Options({}, 1));
+        ASSERT_TRUE(db.Put("first", "one").ok());
+        ASSERT_TRUE(db.Put("second", "two").ok());
+        ASSERT_TRUE(db.Put("third", "three").ok());
+        ASSERT_TRUE(db.WaitForFlush().ok());
+    }
+    EXPECT_TRUE(std::filesystem::exists(fixture.Path() + ".000001"));
+    EXPECT_TRUE(std::filesystem::exists(fixture.Path() + ".000002"));
+    EXPECT_TRUE(std::filesystem::exists(fixture.Path() + ".000003"));
+
+    DBImpl reopened(fixture.Options());
+    ASSERT_TRUE(reopened.Open().ok());
+    std::string value;
+    ASSERT_TRUE(reopened.GetAsOf("first", 1, &value).ok());
+    EXPECT_EQ(value, "one");
+    ASSERT_TRUE(reopened.GetAsOf("second", 2, &value).ok());
+    EXPECT_EQ(value, "two");
+    ASSERT_TRUE(reopened.GetAsOf("third", 3, &value).ok());
+    EXPECT_EQ(value, "three");
 }
 
 TEST(DBTest, ConcurrentReadersAndWriter) {
