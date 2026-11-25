@@ -5,19 +5,26 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 namespace kvstore {
 
 class CompactionTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        static std::atomic<uint64_t> counter{0};
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-        test_dir_ = std::filesystem::temp_directory_path() / ("compaction_test_" + std::to_string(now));
+        const auto instance = counter.fetch_add(1, std::memory_order_relaxed);
+        test_dir_ = std::filesystem::temp_directory_path() /
+                    ("compaction_test_" + std::to_string(::getpid()) + "_" +
+                     std::to_string(now) + "_" + std::to_string(instance));
         std::filesystem::create_directories(test_dir_);
     }
 
@@ -412,15 +419,15 @@ TEST_F(CompactionTest, DBImplWithCompactionEndToEnd) {
     comp_opts.l0_trigger = 3;
     comp_opts.retention_window = 1000;
 
-    auto lm = std::make_shared<LevelManager>(db_dir, 1024 * 1024, 7, 10, comp_opts);
-
-    DBOptions options;
-    options.wal_path = wal_path;
-    options.memtable_limit = 200; // Small limit to trigger frequent flushes from MemTable
-    options.disk = lm;
-
     // 1. Initial run: writes through Person A's DBImpl API, flushes to L0, compactor moves to L1
     {
+        auto lm = std::make_shared<LevelManager>(db_dir, 1024 * 1024, 7, 10, comp_opts);
+
+        DBOptions options;
+        options.wal_path = wal_path;
+        options.memtable_limit = 200; // Small limit to trigger frequent flushes from MemTable
+        options.disk = lm;
+
         DBImpl db(options);
         ASSERT_TRUE(db.Open().ok());
 

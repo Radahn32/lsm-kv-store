@@ -5,20 +5,27 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <string>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 namespace kvstore {
 
 class SmartSchedulerTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        static std::atomic<uint64_t> counter{0};
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-        test_dir_ = std::filesystem::temp_directory_path() / ("smart_scheduler_test_" + std::to_string(now));
+        const auto instance = counter.fetch_add(1, std::memory_order_relaxed);
+        test_dir_ = std::filesystem::temp_directory_path() /
+                    ("smart_scheduler_test_" + std::to_string(::getpid()) + "_" +
+                     std::to_string(now) + "_" + std::to_string(instance));
         std::filesystem::create_directories(test_dir_);
     }
 
