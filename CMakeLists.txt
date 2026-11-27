@@ -37,6 +37,18 @@ target_link_libraries(kvstore_cli PRIVATE kvstore_core)
 add_executable(kvstore_bench src/bench/main.cpp)
 target_link_libraries(kvstore_bench PRIVATE kvstore_core)
 
+# Optional Google Benchmark vs LevelDB head-to-head comparison suite
+option(BUILD_LEVELDB_BENCH "Build Google Benchmark vs LevelDB suite" OFF)
+if(BUILD_LEVELDB_BENCH)
+    find_package(benchmark REQUIRED)
+    find_library(LEVELDB_LIB leveldb REQUIRED)
+    find_path(LEVELDB_INCLUDE_DIR leveldb/db.h REQUIRED)
+
+    add_executable(leveldb_comparison_bench benchmarks/leveldb_comparison.cpp)
+    target_include_directories(leveldb_comparison_bench PRIVATE include ${LEVELDB_INCLUDE_DIR})
+    target_link_libraries(leveldb_comparison_bench PRIVATE kvstore_core benchmark::benchmark ${LEVELDB_LIB})
+endif()
+
 # Auto-discover test executables
 file(GLOB_RECURSE TEST_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*_test.cpp")
 
