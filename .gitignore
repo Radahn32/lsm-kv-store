@@ -70,7 +70,13 @@ Testing/
 build/
 .vscode/
 
-# Database test files
+# Database runtime data directories and test files
+demo_db/
+demo-data/
+kvstore_data/
 *.wal
+*.wal.*
+wal.*
 *.sst
 *.vlog
+MANIFEST*
